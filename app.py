@@ -8,7 +8,7 @@ import datetime
 from dateutil.relativedelta import relativedelta
 
 # Sayfa Yapılandırması
-st.set_page_config(page_title="ChildNest Pro: Sınırsız Takip", page_icon="📈", layout="wide")
+st.set_page_config(page_title="ChildNest Pro: Tedavi Yönetimi", page_icon="💊", layout="wide")
 
 # 1. FIREBASE BAĞLANTISI
 if not firebase_admin._apps:
@@ -28,92 +28,86 @@ def yas_hesapla(dogum_tarihi_str):
     except:
         return "Hesaplanamadı"
 
-def ai_analiz(ates):
-    try:
-        ates = float(ates)
-        if ates >= 39.5: return "🚨 KRİTİK: Çok yüksek ateş!", "#ff4b4b"
-        if ates >= 38.5: return "⚠️ UYARI: Yüksek ateş.", "#ffa500"
-        return "✅ STABİL: Normal sınırlar.", "#2ecc71"
-    except:
-        return "Veri Analiz Edilemiyor", "#7f8c8d"
-
 # --- ROL SEÇİMİ ---
 st.sidebar.title("🚪 Giriş")
 rol = st.sidebar.radio("Rolünüzü Seçin:", ["Ebeveyn Paneli 🏠", "Doktor Paneli 👨‍⚕️"])
 
 # ==========================================
-# 🏠 EBEVEYN PANELİ
+# 👨‍⚕️ DOKTOR PANELİ (Önce Doktor Ayarlar)
 # ==========================================
-if rol == "Ebeveyn Paneli 🏠":
-    st.title("🏠 Ebeveyn Takip Paneli (Sınırsız Giriş)")
-    
-    with st.expander("👶 Çocuk Kimlik Bilgileri"):
-        c_isim = st.text_input("Çocuğun Adı", st.session_state.get('c_isim', ""))
-        c_dogum = st.date_input("Doğum Tarihi", datetime.date(2024, 1, 1))
-        if st.button("Kimliği Kaydet"):
-            st.session_state['c_isim'] = c_isim
-            st.session_state['c_dogum'] = str(c_dogum)
-            st.success("Kimlik başarıyla oluşturuldu!")
-
-    st.divider()
-
-    if 'c_isim' in st.session_state and st.session_state['c_isim'] != "":
-        current_age = yas_hesapla(st.session_state['c_dogum'])
-        st.subheader(f"📝 {st.session_state['c_isim']} İçin Yeni Veri")
-        st.info(f"📊 Bebeğin Tam Yaşı: **{current_age}**")
-
-        with st.form("serbest_form", clear_on_submit=True):
-            col1, col2, col3 = st.columns(3)
-            with col1: ates = st.number_input("Ateş (°C)", step=0.1, format="%.1f")
-            with col2: boy = st.number_input("Boy (cm)", step=0.1)
-            with col3: kilo = st.number_input("Kilo (kg)", step=0.01)
-            
-            st.markdown("---")
-            col_ilac, col_doz = st.columns(2)
-            with col_ilac: ilac_adi = st.text_input("İlaç Adı")
-            with col_doz: dozaj = st.text_input("Dozaj Miktarı")
-            
-            doz_zaman = st.text_input("Doz Zamanı (Serbest Metin)", placeholder="Örn: 6 saatte bir")
-            notlar = st.text_area("Notlar / Semptomlar")
-            
-            if st.form_submit_button("🚀 Verileri Doktora İlet"):
-                db.reference('/Basvurular').push({
-                    'bebek_adi': st.session_state['c_isim'],
-                    'yas_ozet': current_age,
-                    'ates': ates, 'boy': boy, 'kilo': kilo,
-                    'ilac_adi': ilac_adi if ilac_adi else "Yok",
-                    'dozaj': dozaj if dozaj else "Yok",
-                    'doz_zaman': doz_zaman if doz_zaman else "Belirtilmedi",
-                    'notlar': notlar if notlar else "Yok",
-                    'zaman': datetime.datetime.now().strftime("%d/%m/%y %H:%M")
-                })
-                st.success("Tüm veriler sınırsız formatta kaydedildi!")
-    else:
-        st.warning("Lütfen yukarıdan çocuk kimliğini oluşturun.")
-
-# ==========================================
-# 👨‍⚕️ DOKTOR PANELİ
-# ==========================================
-else:
-    st.title("👨‍⚕️ Doktor Analiz Ekranı")
+if rol == "Doktor Paneli 👨‍⚕️":
+    st.title("👨‍⚕️ Doktor Tedavi ve Analiz Paneli")
     veriler = db.reference('/Basvurular').get()
     
     if veriler:
         df = pd.DataFrame(list(veriler.values()))
         secilen = st.selectbox("İncelemek istediğiniz hasta:", df['bebek_adi'].unique())
+        
+        # 💊 İLAÇ ATAMA BÖLÜMÜ (Yeni Özellik)
+        st.subheader(f"💊 {secilen} İçin İlaç/Dozaj Ata")
+        with st.form("ilac_atama"):
+            atanan_ilac = st.text_input("Reçete Edilecek İlaç")
+            atanan_doz = st.text_input("Önerilen Dozaj (Örn: 5ml, 1/2 Tablet)")
+            talimat = st.text_area("Kullanım Talimatı")
+            if st.form_submit_button("Reçeteyi Ebeveyne Gönder"):
+                db.reference(f'/Receteler/{secilen}').set({
+                    'ilac': atanan_ilac,
+                    'doz': atanan_doz,
+                    'talimat': talimat,
+                    'tarih': datetime.datetime.now().strftime("%d/%m/%y %H:%M")
+                })
+                st.success("Reçete ebeveyn paneline başarıyla iletildi!")
+
+        st.divider()
+        # ANALİZ VE GRAFİKLER
         b_df = df[df['bebek_adi'] == secilen].sort_values(by='zaman')
-        son = b_df.iloc[-1]
-        
-        st.metric("Güncel Yaş Bilgisi", son.get('yas_ozet', '-'))
-        
-        rapor, renk = ai_analiz(son['ates'])
-        st.markdown(f"<div style='background:{renk}; padding:15px; border-radius:10px; color:white; text-align:center; font-weight:bold;'>{rapor}</div>", unsafe_allow_html=True)
-        
-        g1, g2 = st.columns(2)
-        with g1: st.plotly_chart(px.line(b_df, x='zaman', y='ates', title="Serbest Ölçek Ateş Grafiği", markers=True), use_container_width=True)
-        with g2: st.plotly_chart(px.line(b_df, x='zaman', y=['boy', 'kilo'], title="Serbest Ölçek Gelişim Analizi", markers=True), use_container_width=True)
-            
-        st.subheader("📋 Klinik Veri Özeti")
-        st.dataframe(b_df[['zaman', 'yas_ozet', 'ates', 'boy', 'kilo', 'ilac_adi', 'dozaj', 'doz_zaman', 'notlar']].iloc[::-1], use_container_width=True)
+        st.metric("Güncel Yaş", yas_hesapla(st.session_state.get('c_dogum', "2024-01-01")))
+        st.plotly_chart(px.line(b_df, x='zaman', y='ates', title="Ateş Grafiği"), use_container_width=True)
+        st.table(b_df[['zaman', 'ates', 'boy', 'kilo', 'notlar']].iloc[::-1])
     else:
-        st.info("Henüz veri girilmemiş.")
+        st.info("Kayıtlı hasta bulunamadı.")
+
+# ==========================================
+# 🏠 EBEVEYN PANELİ
+# ==========================================
+else:
+    st.title("🏠 Ebeveyn Takip Paneli")
+    
+    # Kimlik Bilgileri
+    with st.expander("👶 Çocuk Kimlik Bilgileri"):
+        c_isim = st.text_input("Çocuğun Adı", st.session_state.get('c_isim', ""))
+        c_dogum = st.date_input("Doğum Tarihi", datetime.date(2024, 1, 1))
+        if st.button("Kaydet"):
+            st.session_state['c_isim'] = c_isim
+            st.session_state['c_dogum'] = str(c_dogum)
+            st.rerun()
+
+    if 'c_isim' in st.session_state and st.session_state['c_isim'] != "":
+        st.info(f"📊 Bebeğiniz: **{st.session_state['c_isim']}** | Yaş: **{yas_hesapla(st.session_state['c_dogum'])}**")
+        
+        # 💊 DOKTORDAN GELEN REÇETE (Doktorun atadığı burada görünür)
+        recete_ref = db.reference(f'/Receteler/{st.session_state["c_isim"]}').get()
+        if recete_ref:
+            st.warning(f"🩺 **DOKTORUNUZUN TALİMATI:** \n\n **İlaç:** {recete_ref['ilac']} \n\n **Dozaj:** {recete_ref['doz']} \n\n **Not:** {recete_ref['talimat']}")
+        
+        st.divider()
+        
+        # Ölçüm Girişi
+        with st.form("olcum_ve_doz_istegi"):
+            st.subheader("📝 Günlük Ölçüm ve Dozaj Bildirimi")
+            ates = st.number_input("Ateş (°C)", step=0.1)
+            boy = st.number_input("Boy (cm)", step=0.1)
+            kilo = st.number_input("Kilo (kg)", step=0.01)
+            
+            doz_onayi = st.checkbox("✅ Doktorun verdiği ilacı uyguladım.")
+            ebeveyn_notu = st.text_area("Dozaj sonrası gözleminiz veya sorunuz")
+            
+            if st.form_submit_button("Verileri Gönder"):
+                db.reference('/Basvurular').push({
+                    'bebek_adi': st.session_state['c_isim'],
+                    'ates': ates, 'boy': boy, 'kilo': kilo,
+                    'doz_durumu': "Uygulandı" if doz_onayi else "Uygulanmadı",
+                    'notlar': ebeveyn_notu,
+                    'zaman': datetime.datetime.now().strftime("%d/%m/%y %H:%M")
+                })
+                st.success("Bilgiler iletildi.")
