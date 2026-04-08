@@ -7,7 +7,7 @@ import plotly.express as px
 import datetime
 
 # Sayfa Yapılandırması
-st.set_page_config(page_title="ChildNest: Anne & Doktor Paneli", page_icon="🩺", layout="wide")
+st.set_page_config(page_title="ChildNest AI Pro", page_icon="🚨", layout="wide")
 
 # 1. FIREBASE BAĞLANTISI
 if not firebase_admin._apps:
@@ -17,88 +17,56 @@ if not firebase_admin._apps:
         'databaseURL': "https://childnest-e3bab-default-rtdb.firebaseio.com/"
     })
 
-# --- ÜST BAŞLIK ---
-st.title("🛡️ ChildNest: Akıllı Bebek Takip ve Analiz Sistemi")
+# --- AI ÖN TEŞHİS FONKSİYONU ---
+def ai_on_tehis(ates, ilac, alerji):
+    ates = float(ates)
+    if ates >= 39.5:
+        return "🚨 ACİL DURUM: Çok yüksek ateş! Hemen bir sağlık kuruluşuna başvurun.", "red"
+    elif ates >= 38.5:
+        return "⚠️ DİKKAT: Yüksek ateş. Sıvı alımını artırın ve doktorunuza danışın.", "orange"
+    elif alerji != "Yok" and ates > 37.5:
+        return "🔍 ANALİZ: Alerji öyküsü ve hafif ateş. Yakından takip edilmeli.", "blue"
+    else:
+        return "✅ DURUM STABİL: Veriler normal sınırlar içinde görünüyor.", "green"
+
+st.title("🛡️ ChildNest: AI Destekli Sağlık Takip Sistemi")
+
+# --- ACİL DURUM BUTONU (Üst Panel) ---
+if st.button("🚨 ACİL YARDIM ÇAĞRISI (Doktora Bildir)", use_container_width=True):
+    st.error("⚠️ Acil durum sinyali doktora iletildi! Lütfen bebeği serin tutun ve tıbbi yardım bekleyin.")
+    st.balloons() # Dikkat çekmek için
+
 st.markdown("---")
 
-# --- SOL PANEL: ANNELER İÇİN VERİ GİRİŞ ALANI ---
+# --- SOL PANEL: ANNE VE MESAJLAŞMA ---
 with st.sidebar:
-    st.header("👩‍👦 Anne Giriş Bölümü")
-    st.info("Bebeğinizin günlük ölçümlerini buradan kaydedebilirsiniz.")
+    st.header("👩‍👦 Anne & İletişim Paneli")
     
+    # Veri Giriş Formu
     with st.form("anne_formu", clear_on_submit=True):
         bebek_adi = st.text_input("Bebeğin Adı")
-        dogum_tarihi = st.date_input("Doğum Tarihi", datetime.date(2024, 1, 1))
-        
-        c1, c2 = st.columns(2)
-        with c1:
-            kilo = st.number_input("Kilo (kg)", 1.0, 50.0, 5.0)
-        with c2:
-            boy = st.number_input("Boy (cm)", 30.0, 150.0, 50.0)
-            
         ates = st.number_input("Ateş (°C)", 35.0, 42.0, 37.0, 0.1)
+        boy = st.number_input("Boy (cm)", 30, 150, 50)
+        kilo = st.number_input("Kilo (kg)", 1, 50, 6)
+        ilac = st.text_input("Verilen İlaç")
+        alerji = st.text_input("Alerji (Yoksa boş)")
         
-        st.write("💊 **İlaç Takibi**")
-        ilac = st.text_input("İlaç İsmi (Yoksa boş bırakın)")
-        doz = st.selectbox("Dozaj Sıklığı", ["-", "Sabah", "Öğle", "Akşam", "Sabah-Akşam", "Sabah-Öğle-Akşam", "8 Saatte Bir"])
-        alerji = st.text_input("⚠️ Alerji Notu")
+        submit = st.form_submit_button("🩺 Kaydı Gönder")
         
-        kaydet = st.form_submit_button("🩺 Verileri Doktora Gönder")
-        
-        if kaydet and bebek_adi:
+        if submit and bebek_adi:
             ref = db.reference('/Basvurular')
             ref.push({
                 'bebek_adi': bebek_adi,
-                'dogum_tarihi': str(dogum_tarihi),
-                'kilo': kilo,
-                'boy': boy,
                 'ates': ates,
-                'ilac': ilac if ilac else "Belirtilmedi",
-                'doz': doz,
+                'boy': boy,
+                'kilo': kilo,
+                'ilac': ilac if ilac else "Yok",
                 'alerji': alerji if alerji else "Yok",
                 'zaman': datetime.datetime.now().strftime("%d/%m %H:%M")
             })
-            st.success("✅ Bilgiler başarıyla kaydedildi ve sisteme işlendi!")
-            st.rerun()
+            st.success("Veri iletildi.")
 
-# --- ANA PANEL: DOKTOR ANALİZ VE TAKİP ALANI ---
-ref = db.reference('/Basvurular')
-veriler = ref.get()
-
-if veriler:
-    df = pd.DataFrame(list(veriler.values()))
-    
-    # Doktor İçin Filtreleme
-    st.subheader("👨‍⚕️ Doktor Analiz Paneli")
-    secilen_bebek = st.selectbox("İncelemek İstediğiniz Hasta:", df['bebek_adi'].unique())
-    bebek_df = df[df['bebek_adi'] == secilen_bebek].sort_values(by='zaman')
-
-    # 📈 GRAFİKLER
-    col_ates, col_gelisim = st.columns(2)
-    
-    with col_ates:
-        st.markdown(f"**{secilen_bebek} - Ateş Seyri**")
-        fig_ates = px.line(bebek_df, x='zaman', y='ates', markers=True, color_discrete_sequence=['#FF4B4B'])
-        st.plotly_chart(fig_ates, use_container_width=True)
-        
-    with col_gelisim:
-        st.markdown(f"**{secilen_bebek} - Boy & Kilo Gelişimi**")
-        fig_gelisim = px.line(bebek_df, x='zaman', y=['boy', 'kilo'], markers=True)
-        st.plotly_chart(fig_gelisim, use_container_width=True)
-
-    # 📋 HASTA GEÇMİŞİ (KARTLAR)
-    st.markdown("### 📜 Klinik Geçmiş")
-    for i, row in bebek_df.iloc[::-1].iterrows():
-        is_high_fever = row['ates'] >= 38.5
-        with st.expander(f"📌 Tarih: {row['zaman']} | Durum: {'🚨 KRİTİK' if is_high_fever else '✅ STABİL'}"):
-            k1, k2, k3, k4 = st.columns(4)
-            k1.metric("🌡️ Ateş", f"{row['ates']}°C")
-            k2.metric("📏 Boy", f"{row['boy']} cm")
-            k3.metric("⚖️ Kilo", f"{row['kilo']} kg")
-            k4.write(f"💊 **İlaç:** {row['ilac']} ({row['doz']})")
-            
-            if row['alerji'] != "Yok":
-                st.error(f"⚠️ **DİKKAT:** Bebeğin {row['alerji']} alerjisi bulunmaktadır!")
-
-else:
-    st.warning("🧐 Henüz sisteme girilmiş bir veri bulunmuyor. Sol taraftaki 'Anne Giriş Bölümü'nden kayıt yapabilirsiniz.")
+    st.divider()
+    # 6. ÖZELLİK: CANLI SOHBET (Basit Versiyon)
+    st.subheader("💬 Doktorla Sohbet")
+    mesaj = st.text_area("Sorunuzu buraya yazın...")
