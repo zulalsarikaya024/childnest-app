@@ -1,2 +1,3 @@
-firebase-admin
 streamlit
+firebase-admin
+plotly
