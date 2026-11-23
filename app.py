@@ -5,9 +5,13 @@ Bu uygulama bilimsel bir araştırma (kullanılabilirlik ve ebeveyn-hekim ileti�
 pilot çalışması) için hazırlanmıştır. Tanı veya tedavi önerisi sunmaz.
 
 Veri modeli (kimliksiz / takma adlı):
-  /katilimcilar/{kod}   -> {yas_ay, kilo, guncelleme}
-  /kayitlar/{push_id}   -> semptom ve ilaç kayıtları
-  /telemetri/{push_id}  -> anonim kullanım olayları (süre, kırmızı bayrak vb.)
+  /katilimcilar/{kod}    -> {yas_ay, kilo, guncelleme}
+  /kayitlar/{push_id}    -> semptom ve ilaç kayıtları
+  /incelemeler/{kod}     -> hekimin son "incelendi" bildirimi {hekim, zaman, mesaj}
+  /sus/{rol}_{kimlik}    -> System Usability Scale yanıtları ve puanı
+  /telemetri/{push_id}   -> anonim kullanım olayları (süre, kırmızı bayrak, inceleme...)
+
+Z ile başlayan katılımcı kodları (Z01, Z99...) test kodudur; analize/CSV'ye girmez.
 """
 
 import datetime as dt
@@ -30,6 +34,7 @@ st.set_page_config(page_title="ChildNest — Pilot Çalışma", page_icon="🧪"
 # ---------------------------------------------------------------------------
 TZ = ZoneInfo("Europe/Istanbul")
 KOD_DESENI = re.compile(r"^[A-Z]\d{2,3}$")  # A01, B12, D105 ...
+TEST_ONEKI = "Z"                             # Z01, Z99 -> test kodu, analiz dışı
 ATES_ESIGI = 39.0                            # bu değer ve üzeri -> kırmızı bayrak
 BEBEK_ATES_ESIGI = 38.0                      # 3 aydan küçükte bu değer ve üzeri -> kırmızı bayrak
 FORM_HEDEF_SN = 120                          # "2 dakikada doldurulabilir" hedefi
@@ -49,6 +54,29 @@ DIGER_SEMPTOMLAR = [
 ]
 DOZ_BIRIMLERI = ["ml", "mg", "damla", "tablet", "ölçek"]
 
+# Hekimin ebeveyne gösterebileceği sabit, klinik içermeyen mesajlar (serbest metin yok)
+INCELEME_MESAJLARI = [
+    "(mesaj yok)",
+    "Kayıtlarınız için teşekkürler.",
+    "Muayenede birlikte değerlendireceğiz.",
+    "Kayıt tutmaya devam etmeniz faydalı olur.",
+]
+
+# System Usability Scale (Brooke, 1996). Makalede yayımlanmış geçerli Türkçe uyarlamanın
+# madde metinlerini kullanın; buradaki ifadeler ona yakın bir çeviridir.
+SUS_MADDELERI = [
+    "Bu uygulamayı sık sık kullanmak isterim.",
+    "Uygulamayı gereksiz yere karmaşık buldum.",
+    "Uygulamanın kullanımı kolaydı.",
+    "Bu uygulamayı kullanabilmek için teknik birinin desteğine ihtiyaç duyarım.",
+    "Uygulamadaki işlevlerin iyi bir şekilde bir araya getirildiğini düşünüyorum.",
+    "Uygulamada çok fazla tutarsızlık olduğunu düşünüyorum.",
+    "Çoğu kişinin bu uygulamayı çok çabuk öğreneceğini düşünüyorum.",
+    "Uygulamayı kullanmayı çok zahmetli buldum.",
+    "Uygulamayı kullanırken kendime çok güvendim.",
+    "Bu uygulamayı kullanmadan önce birçok şey öğrenmem gerekti.",
+]
+
 UYARI_METNI = (
     "Bu platform **bilimsel araştırma ve kullanılabilirlik testi** amacıyla hazırlanmıştır. "
     "**Tanı veya tedavi önerisi sunmaz;** acil durumlarda en yakın sağlık kuruluşuna "
@@ -58,6 +86,14 @@ UYARI_METNI = (
 
 def simdi() -> dt.datetime:
     return dt.datetime.now(TZ)
+
+
+def zaman_cevir(deger) -> pd.Timestamp:
+    return pd.Timestamp(deger).tz_convert(TZ)
+
+
+def test_kodu_mu(kod) -> bool:
+    return str(kod or "").upper().startswith(TEST_ONEKI)
 
 
 # ---------------------------------------------------------------------------
@@ -146,7 +182,7 @@ depo = depo_al()
 
 
 # ---------------------------------------------------------------------------
-# TELEMETRİ (anonim: yalnızca katılımcı kodu + oturum kimliği + olay)
+# TELEMETRİ (anonim: yalnızca katılımcı/hekim kodu + oturum kimliği + olay)
 # ---------------------------------------------------------------------------
 if "oturum_id" not in st.session_state:
     st.session_state.oturum_id = uuid.uuid4().hex[:12]
@@ -197,13 +233,47 @@ def kirmizi_bayrak_kutusu(nedenler):
 
 def kayitlari_getir(katilimci=None) -> pd.DataFrame:
     veri = depo.oku("/kayitlar")
-    df = pd.DataFrame(list(veri.values())) if veri else pd.DataFrame()
-    if df.empty:
-        return df
+    if not veri:
+        return pd.DataFrame()
+    df = pd.DataFrame([{**v, "id": k} for k, v in veri.items()])
     if katilimci:
         df = df[df["katilimci"] == katilimci]
-    df["zaman_dt"] = pd.to_datetime(df["zaman"])
+        if df.empty:
+            return df
+    df["zaman_dt"] = pd.to_datetime(df["zaman"], utc=True).dt.tz_convert(TZ)
     return df.sort_values("zaman_dt").reset_index(drop=True)
+
+
+def sus_puani(cevaplar: list[int]) -> float:
+    """Tek maddeler: (yanıt-1), çift maddeler: (5-yanıt); toplam x 2.5 -> 0-100."""
+    return sum((c - 1) if i % 2 == 0 else (5 - c) for i, c in enumerate(cevaplar)) * 2.5
+
+
+def sus_anketi(rol: str, kimlik: str, katilimci: str | None = None, **ek):
+    yol = f"/sus/{rol}_{kimlik}"
+    mevcut = depo.oku(yol)
+    baslik = "📝 Kısa değerlendirme anketi (10 soru, ~2 dk)"
+    with st.expander(baslik + (" — ✅ tamamlandı" if mevcut else ""), expanded=False):
+        if mevcut:
+            st.success(f"Teşekkürler! Anketi {zaman_cevir(mevcut['zaman']):%d.%m.%Y} "
+                       "tarihinde tamamladınız.")
+            return
+        st.caption("Her ifade için: 1 = Kesinlikle katılmıyorum · 5 = Kesinlikle katılıyorum")
+        with st.form(f"sus_{rol}"):
+            cevaplar = [
+                st.radio(f"{i}. {madde}", [1, 2, 3, 4, 5], index=None, horizontal=True,
+                         key=f"sus_{rol}_{i}")
+                for i, madde in enumerate(SUS_MADDELERI, 1)
+            ]
+            if st.form_submit_button("Anketi gönder", type="primary"):
+                if None in cevaplar:
+                    st.error("Lütfen tüm soruları yanıtlayın.")
+                else:
+                    puan = sus_puani(cevaplar)
+                    depo.yaz(yol, {"rol": rol, "kimlik": kimlik, "cevaplar": cevaplar,
+                                   "puan": puan, "zaman": simdi().isoformat(timespec="seconds")})
+                    telemetri("sus_tamamlandi", rol, katilimci, sus_puani=puan, **ek)
+                    st.rerun()
 
 
 # ---------------------------------------------------------------------------
@@ -211,13 +281,23 @@ def kayitlari_getir(katilimci=None) -> pd.DataFrame:
 # ---------------------------------------------------------------------------
 st.warning(UYARI_METNI, icon="⚠️")
 
+ROLLER = ["Ebeveyn", "Hekim", "Araştırmacı"]
+_url_rol = {"ebeveyn": 0, "hekim": 1, "arastirmaci": 2}.get(
+    str(st.query_params.get("rol", "")).lower(), 0)
 st.sidebar.title("🧪 ChildNest Pilot")
-rol = st.sidebar.radio("Rolünüzü seçin:", ["Ebeveyn", "Hekim", "Araştırmacı"])
+rol = st.sidebar.radio("Rolünüzü seçin:", ROLLER, index=_url_rol)
 st.sidebar.caption(f"Veri deposu: {depo.ad}")
 
 
+def oturumu_kapat():
+    for k in list(st.session_state.keys()):
+        if k != "oturum_id":
+            del st.session_state[k]
+    st.rerun()
+
+
 def sifre_kontrol(secret_adi: str, etiket: str) -> bool:
-    """Hekim/araştırmacı panelleri için basit erişim şifresi (st.secrets içinde)."""
+    """Araştırmacı paneli için basit erişim şifresi (st.secrets içinde)."""
     beklenen = _secret(secret_adi)
     if not beklenen:
         st.error(f"Bu panel kapalı: `{secret_adi}` secrets içinde tanımlı değil.")
@@ -239,11 +319,13 @@ def sifre_kontrol(secret_adi: str, etiket: str) -> bool:
 # ===========================================================================
 def ebeveyn_paneli():
     st.title("🏠 Semptom ve İlaç Kayıt Formu")
+    ss = st.session_state
 
     # --- 1) Katılımcı girişi (kimlik bilgisi yok, yalnızca kod) ---
-    if not st.session_state.get("katilimci"):
+    if not ss.get("katilimci"):
         with st.form("katilimci_giris"):
-            kod = st.text_input("Katılımcı Kodu", placeholder="Örn: A01",
+            kod = st.text_input("Katılımcı Kodu", value=st.query_params.get("kod", ""),
+                                placeholder="Örn: A01",
                                 help="Araştırma ekibinin size verdiği kod.").strip().upper()
             onam = st.checkbox("Bilgilendirilmiş onam formunu okudum ve imzaladım.")
             if st.form_submit_button("Giriş", type="primary"):
@@ -252,22 +334,37 @@ def ebeveyn_paneli():
                 elif not onam:
                     st.error("Devam etmek için onam kutusunu işaretleyin.")
                 else:
-                    st.session_state.katilimci = kod
+                    ss.katilimci = kod
                     telemetri("oturum_acildi", "ebeveyn", kod)
                     st.rerun()
         return
 
-    kod = st.session_state.katilimci
+    kod = ss.katilimci
     profil = depo.oku(f"/katilimcilar/{kod}")
 
     c1, c2 = st.columns([4, 1])
-    c1.info(f"Katılımcı: **{kod}** · Çocuğun yaşı: **{yas_metni(profil.get('yas_ay'))}** · "
+    c1.info(f"Katılımcı: **{kod}**{' (TEST)' if test_kodu_mu(kod) else ''} · "
+            f"Çocuğun yaşı: **{yas_metni(profil.get('yas_ay'))}** · "
             f"Kilo: **{profil.get('kilo', '—')} kg**")
     if c2.button("Çıkış"):
-        for k in list(st.session_state.keys()):
-            if k != "oturum_id":
-                del st.session_state[k]
-        st.rerun()
+        oturumu_kapat()
+
+    # --- Hekim inceleme bildirimi (iletişimin ebeveyne dönen tarafı) ---
+    gecmis = kayitlari_getir(kod)
+    inceleme = depo.oku(f"/incelemeler/{kod}")
+    if inceleme:
+        t = zaman_cevir(inceleme["zaman"])
+        mesaj = f"🩺 Hekiminiz kayıtlarınızı **{t:%d.%m.%Y %H:%M}** tarihinde inceledi. ✓"
+        if inceleme.get("mesaj"):
+            mesaj += f"\n\n💬 “{inceleme['mesaj']}”"
+        st.success(mesaj)
+        if not gecmis.empty and gecmis["zaman_dt"].max() > t:
+            st.caption("Bu tarihten sonraki kayıtlarınız henüz incelenmedi.")
+        gorulen = ss.setdefault("gorulen_incelemeler", set())
+        if inceleme["zaman"] not in gorulen:
+            gorulen.add(inceleme["zaman"])
+            telemetri("inceleme_goruldu", "ebeveyn", kod, inceleme_zamani=inceleme["zaman"],
+                      hekim=inceleme.get("hekim", ""))
 
     # --- 2) Çocuk bilgisi: yalnızca yaş (ay/yıl) ve kilo ---
     with st.expander("👶 Çocuk Bilgisi (yaş ve kilo)", expanded=not profil):
@@ -293,6 +390,12 @@ def ebeveyn_paneli():
 
     kayit_formu(kod, profil)
 
+    if not gecmis.empty:
+        with st.expander(f"📋 Önceki kayıtlarım ({len(gecmis)})"):
+            for _, r in gecmis.iloc[::-1].head(10).iterrows():
+                st.markdown(f"- {kayit_satiri(r)}")
+        sus_anketi("ebeveyn", kod, katilimci=kod)
+
 
 def _ilk_etkilesim():
     """Herhangi bir form alanına ilk dokunulduğu an (tamamlama süresinin başlangıcı)."""
@@ -300,13 +403,21 @@ def _ilk_etkilesim():
         st.session_state.form_ilk_etkilesim = simdi()
 
 
+def _formu_sifirla():
+    ss = st.session_state
+    ss.form_no = ss.get("form_no", -1) + 1   # yeni widget anahtarları -> boş form
+    ss.form_acilis = simdi()                 # form ekrana geldiği an
+    ss.form_ilk_etkilesim = None
+    ss.form_bayrak_sayisi = 0                # bu form doldurulurken kaç kez tetiklendi
+    ss.onceki_bayrak = False
+    ss.bayrak_zamani = None
+    ss.bayrak_onaylandi = False
+
+
 def kayit_formu(kod, profil):
     ss = st.session_state
-    ss.setdefault("form_no", 0)                 # her kayıttan sonra formu sıfırlamak için
-    ss.setdefault("form_acilis", simdi())        # form ekrana geldiği an
-    ss.setdefault("form_ilk_etkilesim", None)
-    ss.setdefault("form_bayrak_sayisi", 0)       # bu form doldurulurken kaç kez tetiklendi
-    ss.setdefault("onceki_bayrak", False)
+    if "form_no" not in ss:
+        _formu_sifirla()
     n = ss.form_no
 
     st.subheader("📝 Yeni Kayıt")
@@ -328,11 +439,22 @@ def kayit_formu(kod, profil):
         # Kırmızı bayrak: kayıt beklenmeden, alan değiştiği anda gösterilir
         nedenler = kirmizi_bayrak_nedenleri(ates, semptomlar, profil.get("yas_ay"))
         if nedenler:
-            kirmizi_bayrak_kutusu(nedenler)
             if not ss.onceki_bayrak:  # yeni tetiklenme (kapalı -> açık geçişi)
                 ss.form_bayrak_sayisi += 1
+                ss.bayrak_zamani = simdi()
+                ss.bayrak_onaylandi = False
                 telemetri("kirmizi_bayrak_tetiklendi", "ebeveyn", kod, nedenler=nedenler)
-        ss.onceki_bayrak = bool(nedenler)
+            ss.onceki_bayrak = True
+            kirmizi_bayrak_kutusu(nedenler)
+            if ss.bayrak_onaylandi:
+                st.caption("✓ Uyarıyı okuduğunuzu belirttiniz.")
+            elif st.button("✓ Okudum, anladım", key=f"bayrak_onay_{n}_{ss.form_bayrak_sayisi}"):
+                ss.bayrak_onaylandi = True
+                telemetri("kirmizi_bayrak_onaylandi", "ebeveyn", kod,
+                          onay_suresi_sn=round((simdi() - ss.bayrak_zamani).total_seconds(), 1))
+                st.rerun()
+        else:
+            ss.onceki_bayrak = False
 
         st.markdown("**3. Verilen ilaç** (varsa)")
         ilac_verildi = st.toggle("İlaç verdim", key=f"ilac_var_{n}", on_change=_ilk_etkilesim)
@@ -377,6 +499,7 @@ def kayit_formu(kod, profil):
                     "notlar": notlar.strip(),
                     "kirmizi_bayrak": bool(nedenler),
                     "bayrak_nedenleri": nedenler,
+                    "bayrak_onaylandi": ss.bayrak_onaylandi if nedenler else None,
                 })
                 telemetri(
                     "kayit_tamamlandi", "ebeveyn", kod,
@@ -384,16 +507,12 @@ def kayit_formu(kod, profil):
                     sure_acilistan_sn=round((bitis - ss.form_acilis).total_seconds(), 1),
                     kirmizi_bayrak_tetiklenme=ss.form_bayrak_sayisi,
                     kayitta_kirmizi_bayrak=bool(nedenler),
+                    kirmizi_bayrak_onaylandi=ss.bayrak_onaylandi if nedenler else None,
                     semptom_sayisi=len(semptomlar),
                     ilac_girildi=bool(ilac),
                 )
                 ss.son_kayit = {"sure": sure, "bayrak": nedenler}
-                # formu sıfırla
-                ss.form_no += 1
-                ss.form_acilis = simdi()
-                ss.form_ilk_etkilesim = None
-                ss.form_bayrak_sayisi = 0
-                ss.onceki_bayrak = False
+                _formu_sifirla()
                 st.rerun()
 
     if ss.get("son_kayit"):
@@ -402,16 +521,50 @@ def kayit_formu(kod, profil):
             st.error("Kayıttaki acil belirtiler nedeniyle lütfen bir sağlık kuruluşuna başvurun.")
         ss.son_kayit = None
 
-    gecmis = kayitlari_getir(kod)
-    if not gecmis.empty:
-        with st.expander(f"📋 Önceki kayıtlarım ({len(gecmis)})"):
-            for _, r in gecmis.iloc[::-1].head(10).iterrows():
-                st.markdown(f"- {kayit_satiri(r)}")
-
 
 # ===========================================================================
 # 👩‍⚕️ HEKİM PANELİ
 # ===========================================================================
+def hekim_hesaplari() -> dict:
+    """secrets: [hekimler.H1] sifre="..." katilimcilar=["A01","A02"]  ("*" = tümü).
+    Geriye dönük uyum: yalnızca doktor_sifresi varsa H0 kodlu, herkesi gören hesap."""
+    hesaplar = {}
+    try:
+        for hk, h in dict(st.secrets["hekimler"]).items():
+            hesaplar[str(hk).upper()] = {
+                "sifre": str(h["sifre"]),
+                "katilimcilar": [str(x).upper() for x in (h["katilimcilar"] if "katilimcilar" in h else [])],
+            }
+    except Exception:
+        pass
+    eski = _secret("doktor_sifresi")
+    if eski and "H0" not in hesaplar:
+        hesaplar["H0"] = {"sifre": str(eski), "katilimcilar": ["*"]}
+    return hesaplar
+
+
+def hekim_girisi():
+    ss = st.session_state
+    if ss.get("hekim"):
+        return ss.hekim
+    hesaplar = hekim_hesaplari()
+    if not hesaplar:
+        st.error("Bu panel kapalı: secrets içinde `[hekimler]` tanımlı değil.")
+        return None
+    with st.form("hekim_giris"):
+        hk = st.text_input("Hekim kodu", value=st.query_params.get("hekim", ""),
+                           placeholder="Örn: H1").strip().upper()
+        sifre = st.text_input("Şifre", type="password")
+        if st.form_submit_button("Giriş", type="primary"):
+            h = hesaplar.get(hk)
+            if h and hmac.compare_digest(sifre.encode(), h["sifre"].encode()):
+                ss.hekim = {"kod": hk, "katilimcilar": h["katilimcilar"]}
+                telemetri("oturum_acildi", "hekim", hekim=hk)
+                st.rerun()
+            st.error("Hekim kodu veya şifre hatalı.")
+    return None
+
+
 def kayit_satiri(r) -> str:
     parcalar = [r["zaman_dt"].strftime("%d.%m.%Y %H:%M")]
     if pd.notna(r.get("ates")):
@@ -465,21 +618,52 @@ def yazdir_butonu(metin: str, kod: str):
 
 def hekim_paneli():
     st.title("👩‍⚕️ Hekim Görünüm Paneli")
-    if not sifre_kontrol("doktor_sifresi", "Hekim"):
+    hekim = hekim_girisi()
+    if not hekim:
         return
+    hk = hekim["kod"]
+    izinli = hekim["katilimcilar"]
+
+    c1, c2 = st.columns([4, 1])
+    c1.caption(f"Giriş: **{hk}** · "
+               + ("tüm katılımcılar" if "*" in izinli else f"{len(izinli)} atanmış katılımcı"))
+    if c2.button("Çıkış"):
+        oturumu_kapat()
 
     df_tumu = kayitlari_getir()
+    if not df_tumu.empty:
+        gorebilir = df_tumu["katilimci"].map(
+            lambda k: "*" in izinli or k in izinli or test_kodu_mu(k))
+        df_tumu = df_tumu[gorebilir]
     if df_tumu.empty:
-        st.info("Henüz kayıt yok.")
+        st.info("Size atanmış katılımcıların henüz kaydı yok.")
+        sus_anketi("hekim", hk, hekim=hk)
         return
 
-    # Katılımcı listesi: kırmızı bayraklılar ve en son kayıt yapanlar üstte
-    ozet = (df_tumu.groupby("katilimci")
-            .agg(son=("zaman_dt", "max"), bayrak=("kirmizi_bayrak", "sum"))
-            .sort_values(["bayrak", "son"], ascending=False))
-    etiket = {k: f"{k}{'  🚨' if r.bayrak else ''}  (son: {r.son:%d.%m %H:%M})"
-              for k, r in ozet.iterrows()}
-    kod = st.selectbox("Katılımcı", list(etiket), format_func=etiket.get)
+    incelemeler = depo.oku("/incelemeler")
+
+    def son_inceleme(k):
+        return zaman_cevir(incelemeler[k]["zaman"]) if k in incelemeler else None
+
+    # Katılımcı listesi: incelenmemiş + kırmızı bayraklı kayıtlar üstte
+    satirlar = []
+    for k, g in df_tumu.groupby("katilimci"):
+        t = son_inceleme(k)
+        yeni = g if t is None else g[g["zaman_dt"] > t]
+        satirlar.append({"kod": k, "son": g["zaman_dt"].max(), "yeni": len(yeni),
+                         "yeni_bayrak": int(yeni["kirmizi_bayrak"].sum())})
+    ozet = pd.DataFrame(satirlar).sort_values(["yeni_bayrak", "yeni", "son"], ascending=False)
+    etiket = {
+        r.kod: f"{r.kod}{'  🚨' if r.yeni_bayrak else ''}"
+               f"{f'  🆕 {r.yeni} yeni' if r.yeni else '  ✓'}  (son: {r.son:%d.%m %H:%M})"
+        for r in ozet.itertuples()
+    }
+    # Liste yeniden sıralansa da (örn. "incelendi" sonrası) seçili katılımcı korunur
+    secenekler = list(etiket)
+    onceki = st.session_state.get("hekim_secili")
+    kod = st.selectbox("Katılımcı", secenekler, format_func=etiket.get,
+                       index=secenekler.index(onceki) if onceki in secenekler else 0)
+    st.session_state.hekim_secili = kod
 
     df = df_tumu[df_tumu["katilimci"] == kod]
     profil = depo.oku(f"/katilimcilar/{kod}")
@@ -487,7 +671,7 @@ def hekim_paneli():
     gorulen = st.session_state.setdefault("gorulen_ozetler", set())
     if kod not in gorulen:
         gorulen.add(kod)
-        telemetri("ozet_goruntulendi", "hekim", kod, kayit_sayisi=len(df))
+        telemetri("ozet_goruntulendi", "hekim", kod, hekim=hk, kayit_sayisi=len(df))
 
     # --- Klinik Özet Kartı ---
     with st.container(border=True):
@@ -511,9 +695,34 @@ def hekim_paneli():
             fig.update_layout(margin=dict(l=0, r=0, t=10, b=0))
             st.plotly_chart(fig, width="stretch")
 
+        t = son_inceleme(kod)
         st.markdown("**Kronolojik kayıtlar (eskiden yeniye)**")
         for i, (_, r) in enumerate(df.iterrows(), 1):
-            st.markdown(f"{i}. {kayit_satiri(r)}")
+            yeni = t is None or r["zaman_dt"] > t
+            st.markdown(f"{i}. {'🆕 ' if yeni else ''}{kayit_satiri(r)}")
+
+    # --- "İncelendi" bildirimi: ebeveyn görür, gecikme telemetriye yazılır ---
+    with st.container(border=True):
+        st.markdown("**✓ İnceleme bildirimi** — ebeveyn, kayıtlarının incelendiğini görür")
+        if t is not None:
+            st.caption(f"Son inceleme: {t:%d.%m.%Y %H:%M} ({incelemeler[kod].get('hekim', '')})")
+        yeni_df = df if t is None else df[df["zaman_dt"] > t]
+        if yeni_df.empty:
+            st.success("Tüm kayıtlar incelendi.")
+        else:
+            mesaj = st.selectbox("Ebeveyne gösterilecek kısa mesaj (isteğe bağlı)",
+                                 INCELEME_MESAJLARI)
+            if st.button(f"✓ {len(yeni_df)} yeni kaydı incelendi olarak işaretle", type="primary"):
+                an = simdi()
+                depo.yaz(f"/incelemeler/{kod}", {
+                    "hekim": hk, "zaman": an.isoformat(timespec="seconds"),
+                    "mesaj": "" if mesaj == INCELEME_MESAJLARI[0] else mesaj,
+                })
+                for _, r in yeni_df.iterrows():
+                    telemetri("kayit_incelendi", "hekim", kod, hekim=hk, kayit_id=r["id"],
+                              kayit_zamani=r["zaman"],
+                              gecikme_dk=round((an - r["zaman_dt"]).total_seconds() / 60, 1))
+                st.rerun()
 
     # --- Tek tıkla kopyala / yazdır / indir ---
     metin = ozet_metni(kod, profil, df)
@@ -524,31 +733,77 @@ def hekim_paneli():
         yazdir_butonu(metin, kod)
     b.download_button("⬇️ .txt indir", metin, file_name=f"childnest_{kod}_ozet.txt")
 
+    st.divider()
+    sus_anketi("hekim", hk, hekim=hk)
+
 
 # ===========================================================================
 # 📊 ARAŞTIRMACI PANELİ (telemetri + CSV dışa aktarım)
 # ===========================================================================
+def _liste_metne(df, kolonlar):
+    for kol in kolonlar:
+        if kol in df:
+            df[kol] = df[kol].apply(lambda x: "; ".join(map(str, x)) if isinstance(x, list) else x)
+    return df
+
+
 def arastirmaci_paneli():
     st.title("📊 Araştırma Metrikleri")
     if not sifre_kontrol("arastirmaci_sifresi", "Araştırmacı"):
         return
 
+    testleri_dahil_et = st.toggle(f"Test kodlarını ({TEST_ONEKI}…) dahil et", value=False)
+
     tel = depo.oku("/telemetri")
     tdf = pd.DataFrame(list(tel.values())) if tel else pd.DataFrame()
     kdf = kayitlari_getir()
+    sus = depo.oku("/sus")
+    sdf = pd.DataFrame(list(sus.values())) if sus else pd.DataFrame()
+
+    if not testleri_dahil_et:
+        if not tdf.empty:
+            tdf = tdf[~tdf["katilimci"].map(test_kodu_mu)]
+        if not kdf.empty:
+            kdf = kdf[~kdf["katilimci"].map(test_kodu_mu)]
+        if not sdf.empty:
+            sdf = sdf[~((sdf["rol"] == "ebeveyn") & sdf["kimlik"].map(test_kodu_mu))]
     if tdf.empty:
         st.info("Henüz telemetri yok.")
         return
 
-    tam = tdf[tdf["olay"] == "kayit_tamamlandi"]
-    bayrak = tdf[tdf["olay"] == "kirmizi_bayrak_tetiklendi"]
+    def olay(ad):
+        return tdf[tdf["olay"] == ad]
+
+    tam = olay("kayit_tamamlandi")
+    bayrak = olay("kirmizi_bayrak_tetiklendi")
+    onay = olay("kirmizi_bayrak_onaylandi")
+    incelendi = olay("kayit_incelendi")
+
+    st.markdown("#### Kullanılabilirlik")
     m = st.columns(5)
     m[0].metric("Ebeveyn katılımcı", tdf.loc[tdf["rol"] == "ebeveyn", "katilimci"].nunique())
     m[1].metric("Tamamlanan form", len(tam))
     if not tam.empty:
         m[2].metric("Medyan süre (sn)", f"{tam['sure_sn'].median():.0f}")
-        m[3].metric(f"≤{FORM_HEDEF_SN} sn oranı", f"%{(tam['sure_sn'] <= FORM_HEDEF_SN).mean()*100:.0f}")
-    m[4].metric("Kırmızı bayrak tetiklenmesi", len(bayrak))
+        m[3].metric(f"≤{FORM_HEDEF_SN} sn oranı",
+                    f"%{(tam['sure_sn'] <= FORM_HEDEF_SN).mean() * 100:.0f}")
+    def sus_ozet(r):
+        p = sdf[sdf["rol"] == r]["puan"] if not sdf.empty else pd.Series(dtype=float)
+        return f"{p.mean():.1f} (n={len(p)})" if len(p) else "—"
+
+    m[4].metric("SUS ebeveyn (ort.)", sus_ozet("ebeveyn"))
+
+    st.markdown("#### Güvenlik ve iletişim")
+    m = st.columns(5)
+    m[0].metric("Kırmızı bayrak tetiklenmesi", len(bayrak))
+    m[1].metric("Uyarı onay oranı",
+                f"%{len(onay) / len(bayrak) * 100:.0f}" if len(bayrak) else "—")
+    m[2].metric("İncelenen kayıt oranı",
+                f"%{incelendi['kayit_id'].nunique() / len(kdf) * 100:.0f}"
+                if len(kdf) and not incelendi.empty else "—")
+    m[3].metric("Medyan inceleme gecikmesi",
+                f"{incelendi['gecikme_dk'].median() / 60:.1f} saat" if not incelendi.empty else "—")
+    m[4].metric("SUS hekim (ort.)", sus_ozet("hekim"))
 
     if not tam.empty:
         st.plotly_chart(px.histogram(tam, x="sure_sn", nbins=20,
@@ -561,23 +816,24 @@ def arastirmaci_paneli():
         ).round(1))
 
     st.markdown("**CSV dışa aktarım** (makale analizi için)")
-    c1, c2 = st.columns(2)
-    tdf_csv = tdf.copy()
-    if "nedenler" in tdf_csv:
-        tdf_csv["nedenler"] = tdf_csv["nedenler"].apply(
-            lambda x: "; ".join(x) if isinstance(x, list) else "")
-    c1.download_button("⬇️ telemetri.csv", tdf_csv.sort_values("zaman").to_csv(index=False),
+    c1, c2, c3 = st.columns(3)
+    t_csv = _liste_metne(tdf.copy(), ["nedenler"])
+    c1.download_button("⬇️ telemetri.csv", t_csv.sort_values("zaman").to_csv(index=False),
                        file_name="childnest_telemetri.csv", mime="text/csv")
     if not kdf.empty:
-        k = kdf.drop(columns=["zaman_dt"]).copy()
-        for kol in ("semptomlar", "bayrak_nedenleri"):
-            if kol in k:
-                k[kol] = k[kol].apply(lambda x: "; ".join(x) if isinstance(x, list) else "")
+        k = _liste_metne(kdf.drop(columns=["zaman_dt"]).reset_index(drop=True),
+                         ["semptomlar", "bayrak_nedenleri"])
         if "ilac" in k:
             ilac = k.pop("ilac").apply(lambda x: x if isinstance(x, dict) else {})
             k = k.join(pd.json_normalize(ilac.tolist()).add_prefix("ilac_"))
         c2.download_button("⬇️ kayitlar.csv", k.to_csv(index=False),
                            file_name="childnest_kayitlar.csv", mime="text/csv")
+    if not sdf.empty:
+        s = sdf.copy()
+        cev = pd.DataFrame(s.pop("cevaplar").tolist(),
+                           columns=[f"m{i}" for i in range(1, 11)], index=s.index)
+        c3.download_button("⬇️ sus.csv", s.join(cev).to_csv(index=False),
+                           file_name="childnest_sus.csv", mime="text/csv")
 
 
 # ---------------------------------------------------------------------------
