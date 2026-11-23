@@ -1,4 +1,4 @@
-streamlit
+streamlit>=1.67
 firebase-admin
+pandas
 plotly
-python-dateutil
