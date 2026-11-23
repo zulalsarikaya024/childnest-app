@@ -109,14 +109,12 @@ def _secret(anahtar, varsayilan=None):
 class FirebaseDepo:
     ad = "Firebase"
 
-    def __init__(self, key_json: str, url: str):
+    def __init__(self, anahtar: dict, url: str):
         import firebase_admin
         from firebase_admin import credentials, db
 
         if not firebase_admin._apps:
-            firebase_admin.initialize_app(
-                credentials.Certificate(json.loads(key_json)), {"databaseURL": url}
-            )
+            firebase_admin.initialize_app(credentials.Certificate(anahtar), {"databaseURL": url})
         self._db = db
 
     def ekle(self, yol, veri):
@@ -169,16 +167,58 @@ class YerelDepo:
         return self._dugum(self._yukle(), yol) or {}
 
 
+class AnahtarHatasi(Exception):
+    pass
+
+
+def firebase_anahtari_coz(ham) -> dict:
+    """Secrets'taki textkey'i sözlüğe çevirir; kopyala-yapıştırda sık görülen bozulmaları onarır.
+    Hata mesajları anahtarın içeriğini ASLA göstermez, yalnızca konum/ipucu verir."""
+    if hasattr(ham, "keys"):                      # [textkey] tablo olarak girilmişse
+        return {k: ham[k] for k in ham.keys()}
+    metin = str(ham).strip()
+    if "BURAYA" in metin:
+        raise AnahtarHatasi("textkey içinde hâlâ 'BURAYA-...' yer tutucusu duruyor; "
+                            "JSON dosyasının içeriğini yapıştırın.")
+    # Akıllı tırnaklar (“ ” ‘ ’) ve görünmez boşluklar -> düz karakter
+    metin = (metin.replace("“", '"').replace("”", '"').replace("‘", "'").replace("’", "'")
+             .replace(" ", " ").replace("﻿", ""))
+    if not metin.startswith("{"):
+        raise AnahtarHatasi("textkey '{' ile başlamalı. JSON dosyasının tamamını kopyalayın.")
+    if not metin.endswith("}"):
+        raise AnahtarHatasi("textkey '}' ile bitmeli. JSON eksik kopyalanmış olabilir.")
+    try:
+        # strict=False: \"\"\" kullanıldığında private_key içindeki gerçek satır sonlarını kabul eder
+        veri = json.loads(metin, strict=False)
+    except json.JSONDecodeError as e:
+        raise AnahtarHatasi(f"textkey geçerli JSON değil (satır {e.lineno}, sütun {e.colno}: "
+                            f"{e.msg}). Dosyayı yeniden kopyalayıp yapıştırın.") from None
+    eksik = [k for k in ("type", "project_id", "private_key", "client_email") if k not in veri]
+    if eksik:
+        raise AnahtarHatasi(f"Anahtarda eksik alan(lar): {', '.join(eksik)}. "
+                            "Firebase'den indirilen hizmet hesabı dosyasını kullanın.")
+    return veri
+
+
 @st.cache_resource
 def depo_al():
     key = _secret("textkey")
     if key:
         url = _secret("database_url", "https://childnest-e3bab-default-rtdb.firebaseio.com/")
-        return FirebaseDepo(key, url)
+        return FirebaseDepo(firebase_anahtari_coz(key), url)
     return YerelDepo()
 
 
-depo = depo_al()
+try:
+    depo = depo_al()
+except AnahtarHatasi as e:
+    st.error(f"🔑 **Firebase anahtarı okunamadı.** {e}\n\n"
+             "Düzeltmek için: Manage app → Settings → Secrets → `textkey` alanı.")
+    st.stop()
+except Exception as e:
+    st.error(f"🔑 **Firebase bağlantısı kurulamadı** ({type(e).__name__}). "
+             "Secrets'taki `textkey` ve `database_url` değerlerini kontrol edin.")
+    st.stop()
 
 
 # ---------------------------------------------------------------------------
