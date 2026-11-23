@@ -19,6 +19,7 @@ import hmac
 import html
 import json
 import re
+import secrets as rastgele
 import uuid
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -38,6 +39,8 @@ TEST_ONEKI = "Z"                             # Z01, Z99 -> test kodu, analiz dı
 ATES_ESIGI = 39.0                            # bu değer ve üzeri -> kırmızı bayrak
 BEBEK_ATES_ESIGI = 38.0                      # 3 aydan küçükte bu değer ve üzeri -> kırmızı bayrak
 FORM_HEDEF_SN = 120                          # "2 dakikada doldurulabilir" hedefi
+PIN_DENEME_SINIRI = 5                        # bu kadar hatalı girişten sonra ...
+PIN_KILIT_DK = 5                             # ... bu kadar dakika giriş kilitlenir
 
 KRITIK_SEMPTOMLAR = [
     "Nefes darlığı / hızlı nefes",
@@ -357,26 +360,67 @@ def sifre_kontrol(secret_adi: str, etiket: str) -> bool:
 # ===========================================================================
 # 🏠 EBEVEYN PANELİ
 # ===========================================================================
+def katilimci_pinleri() -> dict | None:
+    """secrets: [pinler] A01 = "4821" ...  Tanımlı değilse None (yalnızca test kodları girebilir)."""
+    try:
+        return {str(k).upper(): str(v) for k, v in dict(st.secrets["pinler"]).items()}
+    except Exception:
+        return None
+
+
+def katilimci_girisi():
+    ss = st.session_state
+    kilit = ss.get("pin_kilit_bitis")
+    if kilit and simdi() < kilit:
+        kalan = int((kilit - simdi()).total_seconds() // 60) + 1
+        st.error(f"Çok sayıda hatalı deneme. Lütfen {kalan} dakika sonra tekrar deneyin.")
+        return
+
+    with st.form("katilimci_giris"):
+        kod = st.text_input("Katılımcı Kodu", value=st.query_params.get("kod", ""),
+                            placeholder="Örn: A01",
+                            help="Araştırma ekibinin size verdiği kod.").strip().upper()
+        pin = st.text_input("PIN", type="password", max_chars=8,
+                            help="Kodunuzla birlikte size verilen kişisel şifre.").strip()
+        onam = st.checkbox("Bilgilendirilmiş onam formunu okudum ve imzaladım.")
+        if not st.form_submit_button("Giriş", type="primary"):
+            return
+
+    if not KOD_DESENI.match(kod):
+        st.error("Kod biçimi geçersiz. Örnek: A01")
+        return
+    if not onam:
+        st.error("Devam etmek için onam kutusunu işaretleyin.")
+        return
+
+    if not test_kodu_mu(kod):  # Z.. test kodları PIN gerektirmez (analiz dışı)
+        pinler = katilimci_pinleri()
+        if pinler is None:
+            st.error("Katılımcı listesi henüz tanımlanmadı. Lütfen araştırma ekibiyle iletişime geçin.")
+            return
+        beklenen = pinler.get(kod, "")
+        if not (beklenen and hmac.compare_digest(pin.encode(), beklenen.encode())):
+            ss.pin_hata = ss.get("pin_hata", 0) + 1
+            telemetri("giris_basarisiz", "ebeveyn", kod, deneme=ss.pin_hata)
+            if ss.pin_hata >= PIN_DENEME_SINIRI:
+                ss.pin_kilit_bitis = simdi() + dt.timedelta(minutes=PIN_KILIT_DK)
+                ss.pin_hata = 0
+            st.error("Katılımcı kodu veya PIN hatalı.")
+            return
+
+    ss.pin_hata = 0
+    ss.katilimci = kod
+    telemetri("oturum_acildi", "ebeveyn", kod)
+    st.rerun()
+
+
 def ebeveyn_paneli():
     st.title("🏠 Semptom ve İlaç Kayıt Formu")
     ss = st.session_state
 
-    # --- 1) Katılımcı girişi (kimlik bilgisi yok, yalnızca kod) ---
+    # --- 1) Katılımcı girişi (kimlik bilgisi yok: kod + kişisel PIN) ---
     if not ss.get("katilimci"):
-        with st.form("katilimci_giris"):
-            kod = st.text_input("Katılımcı Kodu", value=st.query_params.get("kod", ""),
-                                placeholder="Örn: A01",
-                                help="Araştırma ekibinin size verdiği kod.").strip().upper()
-            onam = st.checkbox("Bilgilendirilmiş onam formunu okudum ve imzaladım.")
-            if st.form_submit_button("Giriş", type="primary"):
-                if not KOD_DESENI.match(kod):
-                    st.error("Kod biçimi geçersiz. Örnek: A01")
-                elif not onam:
-                    st.error("Devam etmek için onam kutusunu işaretleyin.")
-                else:
-                    ss.katilimci = kod
-                    telemetri("oturum_acildi", "ebeveyn", kod)
-                    st.rerun()
+        katilimci_girisi()
         return
 
     kod = ss.katilimci
@@ -787,10 +831,35 @@ def _liste_metne(df, kolonlar):
     return df
 
 
+def pin_uretici():
+    """Rastgele PIN listesi üretir; hiçbir yere kaydetmez, yalnızca kopyalanacak metni gösterir."""
+    pinler = katilimci_pinleri()
+    baslik = "🔐 Katılımcı PIN'leri"
+    baslik += f" — {len(pinler)} kod tanımlı" if pinler else " — henüz tanımlı değil"
+    with st.expander(baslik, expanded=not pinler):
+        st.caption("Aşağıdaki metni Streamlit Secrets'a yapıştırın. PIN'ler uygulamada saklanmaz; "
+                   "katılımcı listenizle birlikte güvenli bir yerde tutun.")
+        a, b, c = st.columns(3)
+        onek = a.text_input("Kod harfi", value="A", max_chars=1).strip().upper() or "A"
+        bas = b.number_input("Başlangıç no", min_value=1, max_value=999, value=1, step=1)
+        adet = c.number_input("Adet", min_value=1, max_value=200, value=30, step=1)
+        if st.button("PIN listesi oluştur"):
+            hane = 3 if bas + adet - 1 > 99 else 2
+            satirlar = ["[pinler]"] + [
+                f'{onek}{i:0{hane}d} = "{rastgele.randbelow(9000) + 1000}"'
+                for i in range(int(bas), int(bas + adet))
+            ]
+            st.code("\n".join(satirlar), language="toml")
+            st.warning("Bu sayfa yenilenince liste kaybolur ve her oluşturmada PIN'ler değişir. "
+                       "Hemen kopyalayın.")
+
+
 def arastirmaci_paneli():
     st.title("📊 Araştırma Metrikleri")
     if not sifre_kontrol("arastirmaci_sifresi", "Araştırmacı"):
         return
+
+    pin_uretici()
 
     testleri_dahil_et = st.toggle(f"Test kodlarını ({TEST_ONEKI}…) dahil et", value=False)
 

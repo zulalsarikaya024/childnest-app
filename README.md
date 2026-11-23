@@ -9,13 +9,15 @@ Ebeveyn-hekim iletişimini ve kullanılabilirliği değerlendiren pilot çalış
 
 | Rol | Erişim | İçerik |
 |---|---|---|
-| Ebeveyn | Katılımcı kodu (örn. `A01`) + onam onayı | Yaş (ay/yıl), kilo; semptom ve ilaç kayıt formu; kırmızı bayrak uyarısı + "Okudum, anladım"; hekimin "incelendi" bildirimi; SUS anketi |
+| Ebeveyn | Katılımcı kodu (örn. `A01`) + kişisel PIN + onam onayı | Yaş (ay/yıl), kilo; semptom ve ilaç kayıt formu; kırmızı bayrak uyarısı + "Okudum, anladım"; hekimin "incelendi" bildirimi; SUS anketi |
 | Hekim | Hekim kodu (`H1`) + kendi şifresi | Yalnızca **kendisine atanmış** katılımcılar; Klinik Özet Kartı, 🆕 incelenmemiş kayıtlar, "incelendi olarak işaretle", kopyala / yazdır / .txt; SUS anketi |
 | Araştırmacı | `arastirmaci_sifresi` | Kullanılabilirlik, güvenlik ve iletişim metrikleri; 3 CSV dışa aktarım |
 
 Ad-soyad, TC kimlik no, doğum tarihi, telefon **toplanmaz**. Hekimin ebeveyne gönderebileceği mesajlar sabit ve klinik içermeyen 3 seçenekle sınırlıdır (serbest metin yok).
 
-**Test kodları:** `Z` ile başlayan kodlar (`Z01`, `Z99`) deneme içindir. Her hekim bunları görür, ancak araştırmacı panelindeki metriklere ve CSV dosyalarına **dahil edilmez** (isteğe bağlı açılabilir).
+**Katılımcı PIN'leri:** Her ebeveyn kodunun yanında 4 haneli kişisel bir PIN ile giriş yapar. PIN'ler yalnızca Secrets'taki `[pinler]` tablosunda durur. Bu tabloda olmayan kodlarla giriş yapılamaz. 5 hatalı denemeden sonra giriş, o tarayıcı oturumu için 5 dakika kilitlenir. Hatalı denemeler telemetriye `giris_basarisiz` olarak yazılır. PIN listesi Araştırmacı panelindeki "🔐 Katılımcı PIN'leri" bölümünden üretilebilir.
+
+**Test kodları:** `Z` ile başlayan kodlar (`Z01`, `Z99`) deneme içindir. PIN gerektirmezler, her hekim bunları görür, ancak araştırmacı panelindeki metriklere ve CSV dosyalarına **dahil edilmez** (isteğe bağlı açılabilir).
 
 ## Kişisel linkler
 
@@ -24,7 +26,7 @@ Katılımcılara ve hekimlere doğrudan doğru ekranı açan link verin:
 - Ebeveyn: `https://<uygulama-adresi>/?rol=ebeveyn&kod=A01`
 - Hekim: `https://<uygulama-adresi>/?rol=hekim&hekim=H1`
 
-Linkler şifre içermez; hekim şifresini yine kendisi girer.
+Linkler şifre içermez. Hekim şifresini, ebeveyn PIN'ini yine kendisi girer. PIN'i linke **eklemeyin**.
 
 ## Kırmızı bayrak kuralları (`app.py` başındaki sabitler)
 
@@ -41,6 +43,7 @@ Uyarı, kayıt beklenmeden alan değiştiği anda gösterilir.
 | Olay | Rol | Alanlar |
 |---|---|---|
 | `oturum_acildi` | ebeveyn / hekim | `hekim` |
+| `giris_basarisiz` | ebeveyn | `deneme`: o oturumdaki hatalı PIN denemesi sırası |
 | `kirmizi_bayrak_tetiklendi` | ebeveyn | `nedenler`. Uyarının kapalıdan açığa her geçişi bir tetiklenme sayılır |
 | `kirmizi_bayrak_onaylandi` | ebeveyn | `onay_suresi_sn`: uyarının çıkmasından "Okudum, anladım"a kadar geçen süre |
 | `kayit_tamamlandi` | ebeveyn | `sure_sn`: ilk alana dokunma → Kaydet. `sure_acilistan_sn`: form açılışı → Kaydet. Ayrıca `kirmizi_bayrak_tetiklenme`, `kayitta_kirmizi_bayrak`, `kirmizi_bayrak_onaylandi`, `semptom_sayisi`, `ilac_girildi` |
@@ -76,6 +79,11 @@ katilimcilar = ["A01", "A02", "A03"]
 sifre = "..."
 katilimcilar = ["B01", "B02"]
 # katilimcilar = ["*"]  -> tüm katılımcıları görür
+
+[pinler]
+A01 = "4821"
+A02 = "1937"
+# ... Araştırmacı panelindeki PIN üreticisiyle oluşturun
 ```
 
 `textkey` tanımlı değilse uygulama **yerel demo modunda** çalışır (`data/childnest_yerel.json`). Streamlit Cloud'da bu dosya kalıcı değildir; pilot çalışmada mutlaka Firebase kullanın.
